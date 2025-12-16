@@ -34,7 +34,8 @@ Je prédis la prochaine Enseigne (Couleur) en utilisant :
 
 **🔹 Informations Générales**
 • `/start` - Afficher ce message d'aide
-• `/stat` - Voir l'état du bot (canaux, mode actif)
+• `/stat` - Voir l'état simple du bot
+• `/etat` - Voir l'état complet du bot (statistiques détaillées)
 
 **🔹 Mode Intelligent (INTER)**
 • `/inter status` - Voir les règles apprises (Top 2 par enseigne)
@@ -121,26 +122,22 @@ class TelegramHandlers:
     # (Le code de _handle_command_deploy n'a pas été modifié)
     def _handle_command_deploy(self, chat_id: int):
         try:
-            self.send_message(chat_id, "📦 **Génération de fin23.zip pour Replit Deployments...**")
+            self.send_message(chat_id, "📦 **Génération de ya.zip pour render.com...**")
             
-            # Liste des fichiers à inclure
             files_to_include = [
                 'main.py', 'bot.py', 'handlers.py', 'card_predictor.py', 
                 'config.py', 'requirements.txt', 'RENDER_DEPLOYMENT_INSTRUCTIONS.md',
-                # Fichiers de données INTER
                 'inter_data.json', 'smart_rules.json', 'sequential_history.json',
                 'collected_games.json', 'inter_mode_status.json',
-                # Fichiers de prédictions
                 'predictions.json', 'processed.json', 'pending_edits.json',
-                # Fichiers de configuration
                 'active_admin_chat_id.json',
-                # Fichiers d'état
                 'last_analysis_time.json', 'last_predicted_game_number.json',
-                'last_prediction_time.json', 'consecutive_fails.json'
+                'last_prediction_time.json', 'consecutive_fails.json',
+                'consecutive_two_wins.json', 'wait_until_next_update.json',
+                'last_reset_time.json', 'prediction_count_by_channel.json'
             ]
             
-            # Créer le fichier zip directement sans tempdir
-            zip_filename = 'fin23.zip'
+            zip_filename = 'ya.zip'
             
             import zipfile
             import os
@@ -148,38 +145,34 @@ class TelegramHandlers:
             with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for filename in files_to_include:
                     if os.path.exists(filename):
-                        # Lire et modifier config.py pour le port 10000
                         if filename == 'config.py':
                             with open(filename, 'r') as f:
                                 content = f.read()
-                            # Remplacer le port 5000 par 10000
                             content = content.replace('int(os.getenv(\'PORT\') or 5000)', 'int(os.getenv(\'PORT\') or 10000)')
+                            content = content.replace('int(os.getenv("PORT") or 5000)', 'int(os.getenv("PORT") or 10000)')
+                            content = content.replace('PORT = 5000', 'PORT = 10000')
                             zipf.writestr(filename, content)
                         else:
                             zipf.write(filename, filename)
                     else:
-                        # Fichiers JSON optionnels - ne pas bloquer si manquants
                         if filename.endswith('.json'):
                             logger.warning(f"⚠️ Fichier JSON optionnel non trouvé: {filename}")
             
-            # Envoyer le fichier
             url = f"{self.base_url}/sendDocument"
             with open(zip_filename, 'rb') as f:
                 files = {'document': (zip_filename, f, 'application/zip')}
-                # Compter les données collectées
                 data_count = len(self.card_predictor.inter_data) if self.card_predictor else 0
                 rules_count = len(self.card_predictor.smart_rules) if self.card_predictor else 0
                 
                 data = {
                     'chat_id': chat_id,
-                    'caption': f'📦 **fin23.zip - Package Replit Deployment**\n\n✅ Port : 5000 (Replit)\n✅ Tous les fichiers inclus\n✅ **{data_count} jeux collectés**\n✅ **{rules_count} règles INTER**\n✅ Instructions incluses\n\n**Déploiement :**\n1. Utilisez Replit Deployments\n2. Variables env : BOT_TOKEN\n3. WEBHOOK_URL auto-configuré\n\nVoir RENDER_DEPLOYMENT_INSTRUCTIONS.md pour les détails',
+                    'caption': f'📦 **ya.zip - Package render.com**\n\n✅ Port : 10000 (render.com)\n✅ Tous les fichiers inclus\n✅ **{data_count} jeux collectés**\n✅ **{rules_count} règles INTER**\n✅ Instructions incluses\n\n**Déploiement render.com :**\n1. Téléversez sur render.com\n2. Variables env : BOT_TOKEN, WEBHOOK_URL\n3. Port : 10000\n\nVoir RENDER_DEPLOYMENT_INSTRUCTIONS.md pour les détails',
                     'parse_mode': 'Markdown'
                 }
                 response = requests.post(url, data=data, files=files, timeout=60)
             
             if response.json().get('ok'):
-                logger.info(f"✅ fin23.zip envoyé avec succès")
-                # Supprimer le fichier local après envoi
+                logger.info(f"✅ ya.zip envoyé avec succès")
                 if os.path.exists(zip_filename):
                     os.remove(zip_filename)
             else:
@@ -254,6 +247,20 @@ class TelegramHandlers:
             ])
         
         self.send_message(chat_id, message, reply_markup=keyboard)
+
+    # --- GESTION COMMANDE /etat ---
+    def _handle_command_etat(self, chat_id: int):
+        """Affiche l'état complet du bot."""
+        if not self.card_predictor:
+            self.send_message(chat_id, "❌ Le moteur de prédiction n'est pas chargé.")
+            return
+        
+        try:
+            message = self.card_predictor.get_bot_status()
+            self.send_message(chat_id, message)
+        except Exception as e:
+            logger.error(f"Erreur /etat : {e}")
+            self.send_message(chat_id, f"❌ Erreur lors de la récupération de l'état: {e}")
 
     # --- GESTION COMMANDE /reset ---
     def _handle_command_reset(self, chat_id: int):
@@ -367,6 +374,8 @@ Le bot est prêt pour de nouvelles prédictions."""
                     pid = self.card_predictor.prediction_channel_id or self.card_predictor.HARDCODED_PREDICTION_ID or "Non défini"
                     mode = "IA" if self.card_predictor.is_inter_mode_active else "Statique"
                     self.send_message(chat_id, f"📊 **STATUS**\nSource (Input): `{sid}`\nPrédiction (Output): `{pid}`\nMode: {mode}")
+                elif text.startswith('/etat'):
+                    self._handle_command_etat(chat_id)
                 elif text.startswith('/deploy'):
                     self._handle_command_deploy(chat_id)
                 elif text.startswith('/collect'):

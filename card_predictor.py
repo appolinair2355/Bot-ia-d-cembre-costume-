@@ -71,6 +71,10 @@ class CardPredictor:
         self.collected_games = self._load_data('collected_games.json', is_set=True)
         
         self.single_trigger_until = self._load_data('single_trigger_until.json', is_scalar=True) or 0
+        self.consecutive_two_wins = self._load_data('consecutive_two_wins.json', is_scalar=True) or 0
+        self.wait_until_next_update = self._load_data('wait_until_next_update.json', is_scalar=True) or 0
+        self.last_reset_time = self._load_data('last_reset_time.json', is_scalar=True) or 0
+        self.prediction_count_by_channel = self._load_data('prediction_count_by_channel.json') or {}
         
         if self.is_inter_mode_active is None:
             self.is_inter_mode_active = True
@@ -127,6 +131,10 @@ class CardPredictor:
         self._save_data(self.pending_edits, 'pending_edits.json')
         self._save_data(self.collected_games, 'collected_games.json')
         self._save_data(self.single_trigger_until, 'single_trigger_until.json')
+        self._save_data(self.consecutive_two_wins, 'consecutive_two_wins.json')
+        self._save_data(self.wait_until_next_update, 'wait_until_next_update.json')
+        self._save_data(self.last_reset_time, 'last_reset_time.json')
+        self._save_data(self.prediction_count_by_channel, 'prediction_count_by_channel.json')
 
     def set_channel_id(self, channel_id: int, channel_type: str):
         if not isinstance(self.config_data, dict): self.config_data = {}
@@ -341,9 +349,9 @@ class CardPredictor:
 
     def check_and_update_rules(self):
         """Vérification périodique (30 minutes)."""
-        if time.time() - self.last_analysis_time > 1800:
+        current_time = time.time()
+        if current_time - self.last_analysis_time > 1800:
             logger.info("🧠 Mise à jour INTER périodique (30 min).")
-            # Force l'activation si on a des données
             if len(self.inter_data) >= 3:
                 self.analyze_and_set_smart_rules(chat_id=self.active_admin_chat_id, force_activate=True)
             else:
@@ -420,7 +428,17 @@ class CardPredictor:
         game_number = self.extract_game_number(message)
         if not game_number: return False, None, None
         
-        # Règle : Ecart de 3 jeux
+        current_time = time.time()
+        if self.wait_until_next_update > 0:
+            if current_time < self.wait_until_next_update:
+                remaining = int((self.wait_until_next_update - current_time) / 60)
+                logger.debug(f"⏳ En attente: {remaining} min restantes avant reprise des prédictions")
+                return False, None, None
+            else:
+                self.wait_until_next_update = 0
+                self._save_all_data()
+                logger.info("✅ Fin d'attente (30 min écoulées). Prédictions reprises.")
+        
         if self.last_predicted_game_number and (game_number - self.last_predicted_game_number < 3):
             return False, None, None
             
@@ -558,6 +576,16 @@ class CardPredictor:
                 prediction['verification_count'] = verification_offset
                 prediction['final_message'] = updated_message
                 self.consecutive_fails = 0
+                
+                if verification_offset == 2:
+                    self.consecutive_two_wins += 1
+                    if self.consecutive_two_wins >= 2:
+                        self.wait_until_next_update = time.time() + 1800
+                        self.consecutive_two_wins = 0
+                        logger.info("⚠️ 2x ✅2️⃣ consécutifs: Attente 30 min avant prochaine prédiction.")
+                else:
+                    self.consecutive_two_wins = 0
+                
                 self._save_all_data()
 
                 verification_result = {
@@ -568,23 +596,27 @@ class CardPredictor:
                 }
                 break 
 
-            # CAS B: ÉCHEC (Seulement confirmé si on a dépassé l'offset 2)
-            elif verification_offset >= 2:
+            elif verification_offset >= 2 and not costume_found:
                 status_symbol = "❌" 
                 updated_message = f"🔵{predicted_game}🔵:{predicted_costume} statut :{status_symbol}"
 
                 prediction['status'] = 'lost'
                 prediction['final_message'] = updated_message
                 
+                self.consecutive_two_wins = 0
+                self.wait_until_next_update = time.time() + 1800
+                
                 if prediction.get('is_inter'):
                     self.is_inter_mode_active = False 
-                    logger.info("❌ Échec INTER : Désactivation automatique.")
+                    logger.info("❌ Échec INTER : Désactivation automatique. Attente 30 min.")
                 else:
                     self.consecutive_fails += 1
                     if self.consecutive_fails >= 2:
                         self.single_trigger_until = time.time() + 3600
                         self.analyze_and_set_smart_rules(force_activate=True) 
                         logger.info("⚠️ 2 Échecs Statiques : Activation INTER (TOP1 uniquement pendant 1h).")
+                    else:
+                        logger.info("❌ Échec Statique : Attente 30 min.")
                 
                 self._save_all_data()
 
@@ -631,6 +663,9 @@ class CardPredictor:
         self.last_predicted_game_number = 0
         self.consecutive_fails = 0
         self.single_trigger_until = 0
+        self.consecutive_two_wins = 0
+        self.wait_until_next_update = 0
+        self.last_reset_time = time.time()
         
         self._save_all_data()
         
@@ -641,6 +676,87 @@ class CardPredictor:
             'kept_inter': len(inter_predictions),
             'removed_pending': removed_pending
         }
+    
+    def get_bot_status(self) -> str:
+        """Retourne l'état complet du bot."""
+        from datetime import datetime
+        
+        total_predictions = len(self.predictions)
+        auto_predictions = sum(1 for p in self.predictions.values() if not p.get('is_inter', False))
+        inter_predictions = sum(1 for p in self.predictions.values() if p.get('is_inter', False))
+        
+        won_predictions = sum(1 for p in self.predictions.values() if p.get('status') == 'won')
+        lost_predictions = sum(1 for p in self.predictions.values() if p.get('status') == 'lost')
+        pending_predictions = sum(1 for p in self.predictions.values() if p.get('status') == 'pending')
+        
+        source_id = self.target_channel_id or self.HARDCODED_SOURCE_ID or "Non défini"
+        prediction_id = self.prediction_channel_id or self.HARDCODED_PREDICTION_ID or "Non défini"
+        
+        last_reset_str = "Jamais"
+        if self.last_reset_time:
+            last_reset_dt = datetime.fromtimestamp(self.last_reset_time)
+            last_reset_str = last_reset_dt.strftime("%d/%m/%Y %H:%M:%S")
+        
+        last_update_str = "Jamais"
+        next_update_str = "N/A"
+        if self.last_analysis_time:
+            last_update_dt = datetime.fromtimestamp(self.last_analysis_time)
+            last_update_str = last_update_dt.strftime("%d/%m/%Y %H:%M:%S")
+            next_update_ts = self.last_analysis_time + 1800
+            next_update_dt = datetime.fromtimestamp(next_update_ts)
+            next_update_str = next_update_dt.strftime("%H:%M:%S")
+        
+        mode_status = "INTER (Intelligent)" if self.is_inter_mode_active else "STATIQUE"
+        current_time = time.time()
+        if self.wait_until_next_update > 0 and current_time < self.wait_until_next_update:
+            remaining_min = int((self.wait_until_next_update - current_time) / 60)
+            wait_status = f"⏳ En attente ({remaining_min} min restantes)"
+        else:
+            wait_status = "✅ Actif"
+        
+        message = f"""📊 **ÉTAT COMPLET DU BOT**
+
+━━━━━━━━━━━━━━━━━━━━━
+🔧 **CONFIGURATION CANAUX**
+━━━━━━━━━━━━━━━━━━━━━
+• Canal Source: `{source_id}`
+• Canal Prédiction: `{prediction_id}`
+
+━━━━━━━━━━━━━━━━━━━━━
+📈 **STATISTIQUES PRÉDICTIONS**
+━━━━━━━━━━━━━━━━━━━━━
+• Total prédictions: {total_predictions}
+  - Automatiques (statiques): {auto_predictions}
+  - INTER (intelligentes): {inter_predictions}
+• Gagnées ✅: {won_predictions}
+• Perdues ❌: {lost_predictions}
+• En attente ⏳: {pending_predictions}
+
+━━━━━━━━━━━━━━━━━━━━━
+🧠 **MODE INTER**
+━━━━━━━━━━━━━━━━━━━━━
+• Mode actuel: {mode_status}
+• État prédictions: {wait_status}
+• Règles intelligentes: {len(self.smart_rules)}
+• Données collectées: {len(self.inter_data)}
+• ✅2️⃣ consécutifs: {self.consecutive_two_wins}/2
+• Échecs consécutifs: {self.consecutive_fails}/2
+
+━━━━━━━━━━━━━━━━━━━━━
+⏰ **HISTORIQUE MISES À JOUR**
+━━━━━━━━━━━━━━━━━━━━━
+• Dernière mise à jour règles: {last_update_str}
+• Prochaine mise à jour: {next_update_str}
+• Dernier reset stock auto: {last_reset_str}
+
+━━━━━━━━━━━━━━━━━━━━━
+💡 **RAPPEL FONCTIONNEMENT**
+━━━━━━━━━━━━━━━━━━━━━
+• Mode INTER: mise à jour règles toutes les 30 min
+• Après 2x ✅2️⃣ ou 1x ❌: attente prochaine mise à jour
+• Top 2 déclencheurs par enseigne utilisés
+"""
+        return message
 
 # Global instance
 card_predictor = CardPredictor()
