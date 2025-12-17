@@ -1,4 +1,3 @@
-
 # card_predictor.py
 import re
 import os
@@ -29,7 +28,7 @@ class CardPredictor:
     def __init__(self, telegram_message_sender=None):
         self.telegram_message_sender = telegram_message_sender
 
-        # Channels (peuvent être redéfinis par /config)
+        # Channels (configurés dynamiquement par /config)
         self.HARDCODED_SOURCE_ID = None
         self.HARDCODED_PREDICTION_ID = None
         self.target_channel_id = self._load("target_channel_id.json")
@@ -52,6 +51,20 @@ class CardPredictor:
         self.wait_until_next_update = self._load("wait_until_next_update.json", default=0)
         self.last_inter_update_time = self._load("last_inter_update.json", default=None)
         self.last_reset_date = self._load("last_reset_date.json", default=None)
+
+    # ======================================================
+    # ⚙️ CONFIGURATION DES CANAUX (/config)
+    # ======================================================
+    def set_channel_id(self, chat_id: int, channel_type: str):
+        if channel_type == "source":
+            self.target_channel_id = chat_id
+            self._save("target_channel_id.json", chat_id)
+
+        elif channel_type == "prediction":
+            self.prediction_channel_id = chat_id
+            self._save("prediction_channel_id.json", chat_id)
+
+        logger.info(f"Canal {channel_type} configuré : {chat_id}")
 
     # ======================================================
     # ⏰ TEMPS & SESSIONS
@@ -83,6 +96,26 @@ class CardPredictor:
             self.last_reset_date = today
             self._save("last_reset_date.json", today)
 
+    def _send_daily_report(self):
+        if not self.telegram_message_sender or not self.prediction_channel_id:
+            return
+
+        total = len(self.predictions)
+        won = sum(1 for p in self.predictions.values() if str(p["status"]).startswith("✅"))
+        lost = sum(1 for p in self.predictions.values() if p["status"] == "❌")
+
+        msg = (
+            "📊 **BILAN DE SESSION**\n\n"
+            f"📈 Total : {total}\n"
+            f"✅ Réussites : {won}\n"
+            f"❌ Échecs : {lost}\n\n"
+            f"🧠 Version IA : {self.get_inter_version()}\n\n"
+            "👨‍💻 Développeur :\n"
+            "SOSSOU Kouamé Appolinaire"
+        )
+
+        self.telegram_message_sender(self.prediction_channel_id, msg)
+
     def _full_reset(self):
         self.inter_data.clear()
         self.smart_rules.clear()
@@ -91,7 +124,6 @@ class CardPredictor:
         self.predictions.clear()
         self.wait_until_next_update = 0
         self.last_inter_update_time = time.time()
-
         self._save_all()
 
     # ======================================================
@@ -105,9 +137,8 @@ class CardPredictor:
         card, suit = info
         self.collected_games.add(game_number)
 
-        prev = game_number - 2
         self.inter_data.append({
-            "numero": prev,
+            "numero": game_number - 2,
             "declencheur": card,
             "result_suit": suit
         })
@@ -122,8 +153,7 @@ class CardPredictor:
 
         rules = []
         for suit, triggers in stats.items():
-            top = sorted(triggers.items(), key=lambda x: x[1], reverse=True)[:2]
-            for trigger, count in top:
+            for trigger, count in sorted(triggers.items(), key=lambda x: x[1], reverse=True)[:2]:
                 rules.append({
                     "trigger": trigger,
                     "predict": suit,
@@ -133,7 +163,6 @@ class CardPredictor:
         self.smart_rules = rules
         self.last_inter_update_time = time.time()
         self.is_inter_mode_active = True
-
         self._save_all()
 
     # ======================================================
@@ -177,10 +206,13 @@ class CardPredictor:
         self._save("predictions.json", self.predictions)
 
     # ======================================================
-    # ✅ VÉRIFICATION DES RÉSULTATS
+    # ✅ VÉRIFICATION
     # ======================================================
     def has_completion_indicators(self, t):
         return any(x in t for x in ["✅", "❌", "🔰"])
+
+    def verify_prediction_from_edit(self, message: str):
+        return self._verify_prediction_common(message)
 
     def _verify_prediction_common(self, message: str):
         game = self.extract_game_number(message)
@@ -202,7 +234,7 @@ class CardPredictor:
             if found:
                 status = SYMBOL_MAP[offset]
                 p["status"] = status
-                if status == "✅2️⃣":
+                if status in ("❌", "✅2️⃣"):
                     self._apply_quarantine(p)
                 self._save_all()
                 return {
@@ -223,26 +255,31 @@ class CardPredictor:
 
         return None
 
-    def verify_prediction_from_edit(self, message: str):
-        return self._verify_prediction_common(message)
-
     def _apply_quarantine(self, prediction):
-        trigger = prediction.get("predicted_from")
-        key = f"{trigger}_{prediction['predicted_costume']}"
-        rule = next((r for r in self.smart_rules if r["trigger"] == trigger), None)
+        trigger_card = None
+        for r in self.smart_rules:
+            if r["predict"] == prediction["predicted_costume"]:
+                trigger_card = r["trigger"]
+                break
+
+        if not trigger_card:
+            return
+
+        key = f"{trigger_card}_{prediction['predicted_costume']}"
+        rule = next((r for r in self.smart_rules if r["trigger"] == trigger_card), None)
+
         if rule:
             self.quarantined_rules[key] = rule["count"]
+
         self.wait_until_next_update = time.time() + 1800
 
     # ======================================================
-    # 📊 STATUS & INTERFACE
+    # 📊 STATUS
     # ======================================================
     def get_bot_status(self):
         total = len(self.predictions)
         won = sum(1 for p in self.predictions.values() if str(p["status"]).startswith("✅"))
         lost = sum(1 for p in self.predictions.values() if p["status"] == "❌")
-
-        version = self.get_inter_version()
 
         return (
             "📊 **STATUT DU BOT**\n\n"
@@ -251,7 +288,7 @@ class CardPredictor:
             f"📈 Prédictions : {total}\n"
             f"✅ Gagnés : {won}\n"
             f"❌ Échecs : {lost}\n\n"
-            f"🔖 Version IA : {version}"
+            f"🔖 Version IA : {self.get_inter_version()}"
         )
 
     def get_inter_status(self):
@@ -272,7 +309,7 @@ class CardPredictor:
         return f"🎯 PRÉDICTION\n🔵{game_number + 2}🔵 : {suit}"
 
     # ======================================================
-    # 🔖 VERSION INTER
+    # 🔖 VERSION
     # ======================================================
     def get_inter_version(self):
         if not self.last_inter_update_time:
@@ -297,7 +334,7 @@ class CardPredictor:
         if not cards:
             return None
         v, s = cards[0]
-        suit = s.replace("❤️", "♥️")
+        suit = "❤️" if s in ("❤️", "♥️") else s
         return f"{v}{suit}", suit
 
     def get_all_cards_in_first_group(self, t):
@@ -305,7 +342,7 @@ class CardPredictor:
         if not m:
             return []
         return [
-            f"{v}{s.replace('❤️','♥️')}"
+            f"{v}{('❤️' if s in ('❤️','♥️') else s)}"
             for v, s in re.findall(r"(\d+|[AKQJ])(♠️|❤️|♦️|♣️|♥️)", m.group(1))
         ]
 
@@ -333,7 +370,3 @@ class CardPredictor:
         self._save("collected_games.json", list(self.collected_games))
         self._save("wait_until_next_update.json", self.wait_until_next_update)
         self._save("last_inter_update.json", self.last_inter_update_time)
-
-
-# ================== INSTANCE ==================
-card_predictor = CardPredictor()
