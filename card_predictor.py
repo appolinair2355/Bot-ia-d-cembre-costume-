@@ -1,338 +1,313 @@
+# ==========================================================
 # card_predictor.py
+# Bot de prédiction intelligent – Déployable Render
+# Développeur : SOSSOU Kouamé Appolinaire
+# ==========================================================
+
 import re
+import time
 import os
 import json
-import time
 import logging
-from datetime import datetime
+from datetime import datetime, time as dtime
+from typing import Optional, Dict, Tuple, List
 from collections import defaultdict
+
 import pytz
-from typing import Optional, Dict, Tuple
+
+# ==========================================================
+# CONFIGURATION DES CANAUX (PRÉCONFIGURÉS)
+# ==========================================================
+
+SOURCE_CHANNEL_ID = -1002682552255
+PREDICTION_CHANNEL_ID = -1003329818758
+
+# ==========================================================
+# CONFIGURATION GÉNÉRALE
+# ==========================================================
+
+BENIN_TZ = pytz.timezone("Africa/Porto-Novo")
+
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def path(f): 
+    return os.path.join(DATA_DIR, f)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# ================== CONFIG ==================
-BENIN_TZ = pytz.timezone("Africa/Porto-Novo")
+# ==========================================================
+# RÈGLES STATIQUES (DÉSACTIVÉES PAR DÉFAUT)
+# ==========================================================
+
+STATIC_RULES = {
+    "10♦️": "♠️", "10♠️": "❤️", "9♣️": "❤️", "9♦️": "♠️",
+    "8♣️": "♠️", "8♠️": "♣️", "7♠️": "♠️", "7♣️": "♣️",
+    "6♦️": "♣️", "6♣️": "♦️", "A❤️": "❤️", "5❤️": "❤️", "5♠️": "♠️"
+}
 
 SYMBOL_MAP = {0: "✅0️⃣", 1: "✅1️⃣", 2: "✅2️⃣"}
 
-PREDICTION_SESSIONS = [
-    (2, 5),
-    (15, 17),
-    (21, 22)
+# ==========================================================
+# SESSIONS DE PRÉDICTION
+# ==========================================================
+
+SESSIONS = [
+    (dtime(2, 0), dtime(5, 0)),
+    (dtime(15, 0), dtime(17, 0)),
+    (dtime(21, 0), dtime(22, 0)),
 ]
 
-# ================== CLASS ==================
+# ==========================================================
+# MESSAGES
+# ==========================================================
+
+def reprise_message(version: str, session: str) -> str:
+    return f"""
+🚀 RELANCE DES PRÉDICTIONS AUTOMATIQUES
+
+⏳ Démarrage dans quelques instants…
+🧠 Mode intelligent : ACTIVÉ
+
+🔄 Dernière mise à jour des règles inter :
+🆕 Version : {version} (🇧🇯)
+
+📊 Session active :
+⏰ {session}
+
+👨‍💻 Développeur :
+SOSSOU Kouamé Appolinaire
+
+🔖 Version du système :
+{version}
+""".strip()
+
+# ==========================================================
+# CLASSE PRINCIPALE
+# ==========================================================
+
 class CardPredictor:
+
     def __init__(self, telegram_message_sender=None):
-        self.telegram_message_sender = telegram_message_sender
+        self.sender = telegram_message_sender
 
-        # Channels (peuvent être redéfinis par /config)
-        self.HARDCODED_SOURCE_ID = None
-        self.HARDCODED_PREDICTION_ID = None
-        self.target_channel_id = self._load("target_channel_id.json")
-        self.prediction_channel_id = self._load("prediction_channel_id.json")
+        self.source_channel = SOURCE_CHANNEL_ID
+        self.prediction_channel = PREDICTION_CHANNEL_ID
 
-        # États
-        self.is_inter_mode_active = True
-        self.static_rules_enabled = False
+        # --- MODES ---
+        self.static_enabled = False
+        self.smart_enabled = True
 
-        # Données IA
-        self.inter_data = self._load("inter_data.json", default=[])
-        self.smart_rules = self._load("smart_rules.json", default=[])
-        self.quarantined_rules = self._load("quarantined_rules.json", default={})
-        self.collected_games = set(self._load("collected_games.json", default=[]))
+        # --- DONNÉES ---
+        self.predictions = self._load("predictions.json", {})
+        self.inter_data = self._load("inter_data.json", [])
+        self.smart_rules = self._load("smart_rules.json", [])
+        self.rule_block = self._load("rule_block.json", {})
+        self.sequential = self._load("sequential.json", {})
+        self.collected = set(self._load("collected.json", []))
 
-        # Prédictions
-        self.predictions = self._load("predictions.json", default={})
-
-        # Timing
-        self.wait_until_next_update = self._load("wait_until_next_update.json", default=0)
-        self.last_inter_update_time = self._load("last_inter_update.json", default=None)
-        self.last_reset_date = self._load("last_reset_date.json", default=None)
+        self.last_inter_update = self._load("last_inter_update.json", 0)
+        self.last_prediction_game = self._load("last_prediction_game.json", 0)
 
     # ======================================================
-    # ⏰ TEMPS & SESSIONS
+    # UTILITAIRES
     # ======================================================
+
     def now(self):
         return datetime.now(BENIN_TZ)
 
-    def is_in_session(self):
-        h = self.now().hour
-        return any(start <= h < end for start, end in PREDICTION_SESSIONS)
-
-    def current_session_label(self):
-        h = self.now().hour
-        for start, end in PREDICTION_SESSIONS:
-            if start <= h < end:
-                return f"{start:02d}h00 – {end:02d}h00"
-        return "Hors session"
-
-    # ======================================================
-    # 🔄 RESET JOURNALIER
-    # ======================================================
-    def check_daily_reset(self):
-        now = self.now()
-        today = now.strftime("%Y-%m-%d")
-
-        if now.hour == 0 and now.minute == 59 and self.last_reset_date != today:
-            self._send_daily_report()
-            self._full_reset()
-            self.last_reset_date = today
-            self._save("last_reset_date.json", today)
-
-    def _full_reset(self):
-        self.inter_data.clear()
-        self.smart_rules.clear()
-        self.quarantined_rules.clear()
-        self.collected_games.clear()
-        self.predictions.clear()
-        self.wait_until_next_update = 0
-        self.last_inter_update_time = time.time()
-
-        self._save_all()
-
-    # ======================================================
-    # 🧠 COLLECTE & ANALYSE INTER
-    # ======================================================
-    def collect_inter_data(self, game_number: int, message: str):
-        info = self.get_first_card_info(message)
-        if not info or game_number in self.collected_games:
-            return
-
-        card, suit = info
-        self.collected_games.add(game_number)
-
-        prev = game_number - 2
-        self.inter_data.append({
-            "numero": prev,
-            "declencheur": card,
-            "result_suit": suit
-        })
-
-        self.analyze_and_set_smart_rules()
-        self._save_all()
-
-    def analyze_and_set_smart_rules(self, chat_id=None, force_activate=False):
-        stats = defaultdict(lambda: defaultdict(int))
-        for d in self.inter_data:
-            stats[d["result_suit"]][d["declencheur"]] += 1
-
-        rules = []
-        for suit, triggers in stats.items():
-            top = sorted(triggers.items(), key=lambda x: x[1], reverse=True)[:2]
-            for trigger, count in top:
-                rules.append({
-                    "trigger": trigger,
-                    "predict": suit,
-                    "count": count
-                })
-
-        self.smart_rules = rules
-        self.last_inter_update_time = time.time()
-        self.is_inter_mode_active = True
-
-        self._save_all()
-
-    # ======================================================
-    # 🎯 PRÉDICTION
-    # ======================================================
-    def should_predict(self, message: str) -> Tuple[bool, Optional[int], Optional[str]]:
-        self.check_daily_reset()
-
-        if not self.is_in_session():
-            return False, None, None
-
-        if time.time() < self.wait_until_next_update:
-            return False, None, None
-
-        if not self.is_inter_mode_active:
-            return False, None, None
-
-        game = self.extract_game_number(message)
-        info = self.get_first_card_info(message)
-        if not game or not info:
-            return False, None, None
-
-        trigger, _ = info
-
-        for rule in self.smart_rules:
-            if rule["trigger"] == trigger:
-                key = f"{trigger}_{rule['predict']}"
-                if key in self.quarantined_rules and self.quarantined_rules[key] >= rule["count"]:
-                    continue
-                return True, game, rule["predict"]
-
-        return False, None, None
-
-    def make_prediction(self, game_number: int, suit: str, message_id: int):
-        self.predictions[game_number + 2] = {
-            "predicted_costume": suit,
-            "status": "pending",
-            "message_id": message_id,
-            "predicted_from": game_number
-        }
-        self._save("predictions.json", self.predictions)
-
-    # ======================================================
-    # ✅ VÉRIFICATION DES RÉSULTATS
-    # ======================================================
-    def has_completion_indicators(self, t):
-        return any(x in t for x in ["✅", "❌", "🔰"])
-
-    def _verify_prediction_common(self, message: str):
-        game = self.extract_game_number(message)
-        if not game:
-            return None
-
-        cards = self.get_all_cards_in_first_group(message)
-
-        for pg, p in self.predictions.items():
-            if p["status"] != "pending":
-                continue
-
-            offset = game - pg
-            if offset < 0 or offset > 2:
-                continue
-
-            found = any(c.endswith(p["predicted_costume"]) for c in cards)
-
-            if found:
-                status = SYMBOL_MAP[offset]
-                p["status"] = status
-                if status == "✅2️⃣":
-                    self._apply_quarantine(p)
-                self._save_all()
-                return {
-                    "type": "edit_message",
-                    "message_id_to_edit": p["message_id"],
-                    "new_message": f"🔵{pg}🔵 : {p['predicted_costume']} → {status}"
-                }
-
-            if offset == 2:
-                p["status"] = "❌"
-                self._apply_quarantine(p)
-                self._save_all()
-                return {
-                    "type": "edit_message",
-                    "message_id_to_edit": p["message_id"],
-                    "new_message": f"🔵{pg}🔵 : {p['predicted_costume']} → ❌"
-                }
-
-        return None
-
-    def verify_prediction_from_edit(self, message: str):
-        return self._verify_prediction_common(message)
-
-    def _apply_quarantine(self, prediction):
-        trigger = prediction.get("predicted_from")
-        key = f"{trigger}_{prediction['predicted_costume']}"
-        rule = next((r for r in self.smart_rules if r["trigger"] == trigger), None)
-        if rule:
-            self.quarantined_rules[key] = rule["count"]
-        self.wait_until_next_update = time.time() + 1800
-
-    # ======================================================
-    # 📊 STATUS & INTERFACE
-    # ======================================================
-    def get_bot_status(self):
-        total = len(self.predictions)
-        won = sum(1 for p in self.predictions.values() if str(p["status"]).startswith("✅"))
-        lost = sum(1 for p in self.predictions.values() if p["status"] == "❌")
-
-        version = self.get_inter_version()
-
-        return (
-            "📊 **STATUT DU BOT**\n\n"
-            f"🧠 Mode intelligent : {'ACTIF' if self.is_inter_mode_active else 'INACTIF'}\n"
-            f"🎯 Session : {self.current_session_label()}\n"
-            f"📈 Prédictions : {total}\n"
-            f"✅ Gagnés : {won}\n"
-            f"❌ Échecs : {lost}\n\n"
-            f"🔖 Version IA : {version}"
-        )
-
-    def get_inter_status(self):
-        msg = "🧠 **RÈGLES INTELLIGENTES (TOP 2)**\n\n"
-        by_suit = defaultdict(list)
-        for r in self.smart_rules:
-            by_suit[r["predict"]].append(r)
-
-        for suit, rules in by_suit.items():
-            msg += f"**{suit}**\n"
-            for r in rules:
-                msg += f"• {r['trigger']} ({r['count']}x)\n"
-            msg += "\n"
-
-        return msg, None
-
-    def prepare_prediction_text(self, game_number, suit):
-        return f"🎯 PRÉDICTION\n🔵{game_number + 2}🔵 : {suit}"
-
-    # ======================================================
-    # 🔖 VERSION INTER
-    # ======================================================
-    def get_inter_version(self):
-        if not self.last_inter_update_time:
-            return "Base neuve"
-        return datetime.fromtimestamp(
-            self.last_inter_update_time,
-            BENIN_TZ
-        ).strftime("%Y-%m-%d | %Hh%M")
-
-    # ======================================================
-    # 🧰 UTILS
-    # ======================================================
-    def extract_game_number(self, t):
-        m = re.search(r"#N(\d+)", t) or re.search(r"🔵(\d+)🔵", t)
-        return int(m.group(1)) if m else None
-
-    def get_first_card_info(self, t):
-        m = re.search(r"\(([^)]*)\)", t)
-        if not m:
-            return None
-        cards = re.findall(r"(\d+|[AKQJ])(♠️|❤️|♦️|♣️|♥️)", m.group(1))
-        if not cards:
-            return None
-        v, s = cards[0]
-        suit = s.replace("❤️", "♥️")
-        return f"{v}{suit}", suit
-
-    def get_all_cards_in_first_group(self, t):
-        m = re.search(r"\(([^)]*)\)", t)
-        if not m:
-            return []
-        return [
-            f"{v}{s.replace('❤️','♥️')}"
-            for v, s in re.findall(r"(\d+|[AKQJ])(♠️|❤️|♦️|♣️|♥️)", m.group(1))
-        ]
-
-    # ======================================================
-    # 💾 SAVE / LOAD
-    # ======================================================
-    def _load(self, file, default=None):
-        if not os.path.exists(file):
-            return default
+    def _load(self, name, default):
         try:
-            with open(file, "r", encoding="utf-8") as f:
+            with open(path(name), "r", encoding="utf-8") as f:
                 return json.load(f)
         except:
             return default
 
-    def _save(self, file, data):
-        with open(file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+    def _save(self, name, data):
+        with open(path(name), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def _save_all(self):
+    def get_version(self) -> str:
+        if not self.last_inter_update:
+            return "Base neuve"
+        return datetime.fromtimestamp(
+            self.last_inter_update, BENIN_TZ
+        ).strftime("%Y-%m-%d | %Hh%M")
+
+    # ======================================================
+    # SESSION
+    # ======================================================
+
+    def in_session(self) -> Optional[str]:
+        now = self.now().time()
+        for start, end in SESSIONS:
+            if start <= now < end:
+                return f"{start.strftime('%Hh%M')} – {end.strftime('%Hh%M')}"
+        return None
+
+    # ======================================================
+    # EXTRACTION
+    # ======================================================
+
+    def extract_game(self, text: str) -> Optional[int]:
+        m = re.search(r"#N(\d+)", text)
+        return int(m.group(1)) if m else None
+
+    def extract_cards(self, text: str) -> List[str]:
+        m = re.search(r"\(([^)]*)\)", text)
+        if not m:
+            return []
+        return [
+            f"{v.upper()}{c.replace('❤️','♥️')}"
+            for v, c in re.findall(r"(\d+|[AKQJ])(♠️|❤️|♦️|♣️|♥️)", m.group(1))
+        ]
+
+    # ======================================================
+    # COLLECTE INTER (TOUJOURS ACTIVE)
+    # ======================================================
+
+    def collect(self, game: int, text: str):
+        if game in self.collected:
+            return
+
+        cards = self.extract_cards(text)
+        if not cards:
+            return
+
+        self.collected.add(game)
+        self.sequential[str(game)] = cards[0]
+
+        prev = str(game - 2)
+        if prev in self.sequential:
+            self.inter_data.append({
+                "trigger": self.sequential[prev],
+                "result": cards[0][-2:]
+            })
+            self.recompute_rules()
+
         self._save("inter_data.json", self.inter_data)
-        self._save("smart_rules.json", self.smart_rules)
-        self._save("quarantined_rules.json", self.quarantined_rules)
+        self._save("sequential.json", self.sequential)
+        self._save("collected.json", list(self.collected))
+
+    # ======================================================
+    # RÈGLES INTELLIGENTES
+    # ======================================================
+
+    def recompute_rules(self):
+        stats = defaultdict(lambda: defaultdict(int))
+        for d in self.inter_data:
+            stats[d["result"]][d["trigger"]] += 1
+
+        rules = []
+        for suit, triggers in stats.items():
+            top = sorted(triggers.items(), key=lambda x: x[1], reverse=True)[:2]
+            for trig, cnt in top:
+                rules.append({
+                    "trigger": trig,
+                    "predict": suit,
+                    "count": cnt
+                })
+
+        self.smart_rules = rules
+        self.last_inter_update = time.time()
+
+        self._save("smart_rules.json", rules)
+        self._save("last_inter_update.json", self.last_inter_update)
+
+    # ======================================================
+    # PRÉDICTION
+    # ======================================================
+
+    def should_predict(self, game: int, text: str) -> Optional[str]:
+        session = self.in_session()
+        if not session or game <= self.last_prediction_game:
+            return None
+
+        cards = self.extract_cards(text)
+        if not cards:
+            return None
+
+        trigger = cards[0]
+
+        if self.smart_enabled:
+            for r in self.smart_rules:
+                key = f"{r['trigger']}_{r['predict']}"
+                if r["trigger"] == trigger:
+                    blocked = self.rule_block.get(key, 0)
+                    if r["count"] > blocked:
+                        return r["predict"]
+
+        if self.static_enabled and trigger in STATIC_RULES:
+            return STATIC_RULES[trigger]
+
+        return None
+
+    def register_prediction(self, game: int, suit: str, msg_id: int):
+        self.predictions[str(game + 2)] = {
+            "from": game,
+            "suit": suit,
+            "status": "pending",
+            "msg_id": msg_id
+        }
+        self.last_prediction_game = game
         self._save("predictions.json", self.predictions)
-        self._save("collected_games.json", list(self.collected_games))
-        self._save("wait_until_next_update.json", self.wait_until_next_update)
-        self._save("last_inter_update.json", self.last_inter_update_time)
+        self._save("last_prediction_game.json", self.last_prediction_game)
 
+    # ======================================================
+    # VÉRIFICATION DES RÉSULTATS
+    # ======================================================
 
-# ================== INSTANCE ==================
+    def verify(self, game: int, text: str):
+        cards = self.extract_cards(text)
+        if not cards:
+            return None
+
+        for g, p in self.predictions.items():
+            if p["status"] != "pending":
+                continue
+
+            offset = game - int(p["from"])
+            if offset < 0 or offset > 2:
+                continue
+
+            if any(c.endswith(p["suit"]) for c in cards):
+                p["status"] = "won"
+                if offset == 2:
+                    self.block_rule(p)
+                return (p, SYMBOL_MAP[offset])
+
+            if offset == 2:
+                p["status"] = "lost"
+                self.block_rule(p)
+                return (p, "❌")
+
+        self._save("predictions.json", self.predictions)
+        return None
+
+    def block_rule(self, p):
+        trigger = self.sequential.get(str(p["from"]))
+        if not trigger:
+            return
+        key = f"{trigger}_{p['suit']}"
+        for r in self.smart_rules:
+            if r["trigger"] == trigger and r["predict"] == p["suit"]:
+                self.rule_block[key] = r["count"]
+        self._save("rule_block.json", self.rule_block)
+
+    # ======================================================
+    # RESET QUOTIDIEN 00h59
+    # ======================================================
+
+    def daily_reset(self):
+        now = self.now().time()
+        if now.hour == 0 and now.minute == 59:
+            for f in os.listdir(DATA_DIR):
+                os.remove(path(f))
+            self.__init__(self.sender)
+
+# ==========================================================
+# INSTANCE
+# ==========================================================
+
 card_predictor = CardPredictor()
